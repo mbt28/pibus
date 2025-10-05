@@ -367,7 +367,15 @@ static void ibus_set_time_and_date(bool change_date, bool change_time)
 		}
 
 		now = mktime(tm);
-		stime(&now);
+		{
+			struct timespec ts;
+			ts.tv_sec = now;
+			ts.tv_nsec = 0;
+			if (clock_settime(CLOCK_REALTIME, &ts) == -1)
+			{
+				perror("clock_settime");
+			}
+		}
 
 		if (change_date && change_time)
 		{
