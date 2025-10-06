@@ -503,11 +503,11 @@ static void ibus_handle_rotary(const unsigned char *msg, int length)
 	switch (msg[4] & 0xF0)
 	{
 		case 0x80:
-			key = ibus.rotary_opposite ? KEY_DOWN : KEY_UP;
+			key = ibus.rotary_opposite ? KEY_LEFT : KEY_RIGHT;
 			break;
 
 		case 0x00:
-			key = ibus.rotary_opposite ? KEY_UP : KEY_DOWN;
+			key = ibus.rotary_opposite ? KEY_RIGHT : KEY_LEFT;
 			break;
 
 		default:
