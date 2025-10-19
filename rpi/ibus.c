@@ -58,6 +58,7 @@ typedef enum
 	INPUT_CDC = 0,
 	INPUT_AUX = 1,
 	INPUT_TAPE = 2,
+	INPUT_TV = 3,
 	INPUT_NONE = 9,
 }
 input_t;
@@ -752,6 +753,18 @@ static void ibus_handle_tape(const unsigned char *buf, int length)
 	}
 }
 
+static void ibus_handle_tv(const unsigned char *buf, int length)
+{
+	if (ibus.input == INPUT_TV)
+	{
+		enter_pi_screen(buf, length);
+	}
+	else
+	{
+		ibus_handle_outsidekey(buf, length);
+	}
+}
+
 static bool is_cdc_message(const unsigned char *buf, int length)
 {
 	/* Copied from attiny code */
@@ -1060,6 +1073,7 @@ events[] =
 
 	{20,"\x68\x12\x3b\x23\x62\x10\x4e\x4f\x20\x54\x41\x50\x45\x20\x20\x20\x20\x20\x20\x31", NULL/*"no tape"*/, NULL, 0, ibus_handle_tape},
 	{21,"\x68\x17\x3b\x23\x62\x30\x20\x20\x07\x20\x20\x20\x20\x20\x08\x54\x41\x50\x45\x20\x31", NULL/*"tape 1"*/, NULL, 0, ibus_handle_tape},
+	{7, "\x3b\x05\x68\x4e\x01\x00\x19", NULL/*"tv"*/, NULL, 0, ibus_handle_tv},
 
 #if 0
 	/* The most common CDC message */
