@@ -4,21 +4,25 @@ STRIP  = aarch64-linux-gnu-strip
 
 CFLAGS  = -Wall -O2 -ggdb
 LDFLAGS =
-LDLIBS  = -lrt   # optional; harmless even if not required
+LDLIBS  = -lgpiod -lrt
 
 SRC = mainloop.c slist.c pibus.c ibus.c ibus-send.c keyboard.c gpio.c server.c log.c annotate.c
+OBJ = $(SRC:.c=.o)
 TARGET = pibus
 
 all: $(TARGET) strip
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 strip: $(TARGET)
 	cp $(TARGET) $(TARGET).debug
 	$(STRIP) -R .comment $(TARGET)
 
 clean:
-	rm -f $(TARGET) $(TARGET).debug *.o
+	rm -f $(OBJ) $(TARGET) $(TARGET).debug
 
 .PHONY: all strip clean

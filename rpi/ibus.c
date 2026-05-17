@@ -31,6 +31,9 @@
 #include "server.h"
 #include "log.h"
 
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
+
 #define SOURCE 0
 #define LENGTH 1
 #define DEST 2
@@ -39,6 +42,7 @@
 /* Based on PiBUS V4.01 hardware */
 
 #define GPIO_NSLP_CTL		22
+#define GPIO_TXD_CTL		14
 #define GPIO_PIN17_CTL		23
 #define GPIO_LED_CTL		24
 #define GPIO_RELAY_CTL		27
@@ -47,9 +51,10 @@
 typedef enum
 {
 	VIDEO_SRC_BMW = 0,
-	VIDEO_SRC_PI = 1,
-	VIDEO_SRC_CAMERA = 2,
-	VIDEO_SRC_LAST = 2
+	VIDEO_SRC_TV = 1,
+	VIDEO_SRC_PI = 2,
+	VIDEO_SRC_CAMERA = 3,
+	VIDEO_SRC_LAST = 3
 }
 videoSource_t;
 
@@ -173,6 +178,14 @@ static void power_off(void)
 		ibus.ifd = -1;
 	}
 
+	if (access("/usr/bin/pinctrl", X_OK) != 0 ||
+		system("/usr/bin/pinctrl set 14 op pd dl") != 0)
+	{
+		gpio_set_pull(GPIO_TXD_CTL, PULL_DOWN);
+		gpio_write(GPIO_TXD_CTL, 0);
+		gpio_set_output(GPIO_TXD_CTL);
+	}
+
 	if (access("/storage/pibus-poweroff.sh", X_OK) == 0)
 	{
 		execl("/bin/sh", "sh", "-c", "/storage/pibus-poweroff.sh", (char *) 0);
@@ -214,25 +227,72 @@ static void ibus_exec(const char *cmd, const char *arg)
 	}
 }
 
+int i2c2_write_bytes(uint8_t addr, const uint8_t *data, size_t len)
+{
+    int fd = open("/dev/i2c-2", O_RDWR);
+    if (fd < 0) return -1;
+
+    if (ioctl(fd, I2C_SLAVE, addr) < 0) {
+        close(fd);
+        return -2;
+    }
+
+    int ret = write(fd, data, len);
+    close(fd);
+
+    return (ret == (int)len) ? 0 : -3;
+}
+
+void mode_bmw()
+{
+    // 0x39 ← 0x0F
+    uint8_t val = 0x0F;
+    i2c2_write_bytes(0x39, &val, 1);
+
+}
+
+void mode_tv()
+{
+    // 0x39 ← 0x17
+    uint8_t val = 0x17;
+    i2c2_write_bytes(0x39, &val, 1);
+
+    // 0x45 ← 0x00 0x07
+    uint8_t buf1[2] = { 0x00, 0x07 };
+    i2c2_write_bytes(0x45, buf1, 2);
+
+    // 0x45 ← 0x11 0x73
+    uint8_t buf2[2] = { 0x11, 0x73 };
+    i2c2_write_bytes(0x45, buf2, 2);
+}
+
 static void ibus_set_video(videoSource_t src)
 {
-	switch (src)
-	{
-		case VIDEO_SRC_BMW:
-			gpio_write(GPIO_RELAY_CTL, 0);	/* relay off */
-			gpio_write(GPIO_PIN17_CTL, 0);	/* pin17 off */
-			break;
+    switch (src)
+    {
+        case VIDEO_SRC_BMW:
+            gpio_write(GPIO_RELAY_CTL, 0); /* relay off */
+            gpio_write(GPIO_PIN17_CTL, 0); /* pin17 off */
+            mode_bmw();
+            break;
 
-		case VIDEO_SRC_PI:
-			gpio_write(GPIO_RELAY_CTL, 0);	/* relay off */
-			gpio_write(GPIO_PIN17_CTL, 1);	/* pin17 on */
-			break;
+        case VIDEO_SRC_TV:
+            gpio_write(GPIO_RELAY_CTL, 0); /* relay off */
+            gpio_write(GPIO_PIN17_CTL, 0); /* pin17 on */
+            mode_tv();
+            break;
 
-		case VIDEO_SRC_CAMERA:
-			gpio_write(GPIO_RELAY_CTL, 1);	/* relay on */
-			gpio_write(GPIO_PIN17_CTL, 1);	/* pin17 on */
-			break;
-	}
+        case VIDEO_SRC_PI:
+            gpio_write(GPIO_RELAY_CTL, 0); /* relay off */
+            gpio_write(GPIO_PIN17_CTL, 1); /* pin17 on */
+            mode_tv();
+            break;
+
+        case VIDEO_SRC_CAMERA:
+            gpio_write(GPIO_RELAY_CTL, 1); /* relay on */
+            gpio_write(GPIO_PIN17_CTL, 1); /* pin17 on */
+            break;
+    }
 }
 
 static void ibus_handle_phone(const unsigned char *msg, int length)
@@ -619,6 +679,12 @@ static void enter_pi_screen(const unsigned char *msg, int length)
 	{
 		ibus.playing = TRUE;
 		cdchanger_send_inforeq();
+	}
+
+	if (ibus.input == INPUT_TV)
+	{
+//		RODATA block_buttons[] = "\x3B\x05\xF0\x05\x0B\x01\xC1";
+//		ibus_send(ibus.ifd, block_buttons, 7, ibus.gpio_number);
 	}
 
 	if (ibus.hw_version >= 4)
@@ -1629,4 +1695,3 @@ void ibus_cleanup(void)
 
 	server_cleanup();
 }
-

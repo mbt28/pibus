@@ -1,16 +1,21 @@
-typedef enum
-{
-	PULL_NONE = 0,
-	PULL_DOWN = 1,
-	PULL_UP = 2
+#ifndef GPIO_H
+#define GPIO_H
+
+#include <stdint.h>
+
+typedef enum {
+    PULL_NONE = 0,
+    PULL_DOWN = 1,
+    PULL_UP   = 2
 } pull_type;
 
-int gpio_init();
+int  gpio_init(void);
+void gpio_cleanup(void);
 void gpio_set_input(int gpio_number);
 void gpio_set_output(int gpio_number);
-int gpio_read(int gpio_number);
+int  gpio_read(int gpio_number);
 void gpio_write(int gpio_number, int value);
 void gpio_set_pull(int gpio_number, pull_type pt);
-void gpio_cleanup();
+int  uart_rx_fifo_empty(void);
 
-int uart_rx_fifo_empty();
+#endif

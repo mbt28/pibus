@@ -1,191 +1,363 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <stdint.h>
+#include <errno.h>
 #include <string.h>
-
+#include <unistd.h>
+#include <gpiod.h>
 #include "gpio.h"
 
-#define V1_BCM2708_PERI_BASE        0x20000000
-#define V1_GPIO_BASE                (V1_BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
+#define MAX_GPIO_LINES 54
 
-#define V2_BCM2708_PERI_BASE        0x3F000000
-#define V2_GPIO_BASE                (V2_BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
+static struct gpiod_chip *chip = NULL;
+static size_t chip_lines = 0;
+/* One line request per GPIO offset. */
+static struct gpiod_line_request *lines[MAX_GPIO_LINES] = { NULL };
+static enum gpiod_line_direction line_directions[MAX_GPIO_LINES];
+static enum gpiod_line_value line_values[MAX_GPIO_LINES];
+static pull_type line_pulls[MAX_GPIO_LINES];
+static int line_pull_configured[MAX_GPIO_LINES];
 
-#define V4_BCM2711_PERI_BASE        0xFE000000
-#define V4_GPIO_BASE                (V4_BCM2711_PERI_BASE + 0x200000) /* GPIO controller */
-
-#define GPIO_PIN_L0_FSEL0_OFFSET	(0)		/* GPFSEL0 */
-#define GPIO_PIN_L0_FSEL1_OFFSET	((0x04/4))	/* GPFSEL1 */
-#define GPIO_PIN_L0_SET_OFFSET		((0x1C/4))	/* GPSET0 */
-#define GPIO_PIN_L0_CLR_OFFSET		((0x28/4))	/* GPCLR0 */
-#define GPIO_PIN_L0_READ_OFFSET		((0x34/4))	/* GPLEV0 */
-
-#define GPIO_INP_GPIO(g) *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define GPIO_OUT_GPIO(g) *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
-
-#define GPIO_PUD	*(gpio+37)	/* Pull up/down */
-#define GPIO_PUDCLK0	*(gpio+38)	/* Pull up/down clock */
-#define GPIO_PUDCLK1	*(gpio+39)	/* Pull up/down clock */
-
-#define UART_FR_OFFSET			((0x1018/4))
-#define UART_FR_RXFE_BIT		0x10
-
-#define BLOCK_SIZE (8*1024)
-
-
-// I/O access
-static volatile unsigned int *gpio;
-
-
-static unsigned int gpio_base_address()
+static int gpio_valid(int gpio_number)
 {
-	char buf[512];
-	int fd;
-	unsigned int base = V1_GPIO_BASE;
-
-	fd = open("/sys/firmware/devicetree/base/model", O_RDONLY);
-	if (fd != -1)
-	{
-		if (read(fd, buf, sizeof (buf)) > 10)
-		{
-			buf[sizeof(buf) - 1] = 0;
-
-			if (strstr(buf, "Pi 2") || strstr(buf, "Pi 3"))
-			{
-				base = V2_GPIO_BASE;
-
-			} else if (strstr(buf, "Pi 4"))
-			{
-				base = V4_GPIO_BASE;
-			}
-		}
-		close(fd);
-	}
-
-	return base;
+    return gpio_number >= 0 &&
+        gpio_number < MAX_GPIO_LINES &&
+        (chip_lines == 0 || (size_t)gpio_number < chip_lines);
 }
 
-int gpio_init()
+static int score_chip(struct gpiod_chip *candidate)
 {
-#ifdef __i386__
-	return 0;
-#else
-	void *gpio_map;
-	int mem_fd;
+    static const unsigned int required[] = { 22, 23, 24, 27 };
+    struct gpiod_chip_info *info;
+    size_t num_lines;
+    int score = 0;
 
-	if ((mem_fd = open("/dev/mem", O_RDWR | O_SYNC) ) < 0)
-	{
-		printf("can't open /dev/mem \n");
-		exit(-1);
-	}
+    info = gpiod_chip_get_info(candidate);
+    if (!info)
+        return -1;
 
-	gpio_map = mmap(
-		NULL,             //Any adddress in our space will do
-		BLOCK_SIZE,       //Map length
-		PROT_READ|PROT_WRITE,// Enable reading & writting to mapped memory
-		MAP_SHARED,       //Shared with other processes
-		mem_fd,           //File to map
-		gpio_base_address()  //Offset to GPIO peripheral
-	);
+    num_lines = gpiod_chip_info_get_num_lines(info);
+    if (num_lines <= required[sizeof(required) / sizeof(required[0]) - 1]) {
+        gpiod_chip_info_free(info);
+        return -1;
+    }
 
-	close(mem_fd); //No need to keep mem_fd open after mmap
+    if (num_lines >= MAX_GPIO_LINES)
+        score += 10;
 
-	if (gpio_map == MAP_FAILED)
-	{
-		printf("mmap error %p\n", gpio_map);//errno also set!
-		exit(-1);
-	}
+    const char *name = gpiod_chip_info_get_name(info);
+    const char *label = gpiod_chip_info_get_label(info);
+    if ((name && strstr(name, "rp1")) || (label && strstr(label, "rp1")))
+        score += 50;
+    if ((name && strstr(name, "pinctrl")) || (label && strstr(label, "pinctrl")))
+        score += 25;
 
-	// Always use volatile pointer!
-	gpio = (volatile unsigned int *)gpio_map;
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        char expected[16];
+        struct gpiod_line_info *line_info;
+        const char *line_name;
 
-	return 0;
-#endif
+        snprintf(expected, sizeof(expected), "GPIO%u", required[i]);
+        line_info = gpiod_chip_get_line_info(candidate, required[i]);
+        if (!line_info)
+            continue;
+
+        line_name = gpiod_line_info_get_name(line_info);
+        if (line_name && strcmp(line_name, expected) == 0)
+            score += 100;
+
+        gpiod_line_info_free(line_info);
+    }
+
+    gpiod_chip_info_free(info);
+    return score;
 }
 
-#ifndef __i386__
+static struct gpiod_chip *open_best_gpiochip(void)
+{
+    struct gpiod_chip *best_chip = NULL;
+    int best_score = -1;
+    const char *override;
+
+    override = getenv("PIBUS_GPIOCHIP");
+    if (override && override[0]) {
+        best_chip = gpiod_chip_open(override);
+        if (!best_chip)
+            perror("gpiod_chip_open");
+        return best_chip;
+    }
+
+    for (int i = 0; i < 32; i++) {
+        struct gpiod_chip *candidate;
+        char path[32];
+        int score;
+
+        snprintf(path, sizeof(path), "/dev/gpiochip%d", i);
+        candidate = gpiod_chip_open(path);
+        if (!candidate)
+            continue;
+
+        score = score_chip(candidate);
+        if (score > best_score) {
+            if (best_chip)
+                gpiod_chip_close(best_chip);
+            best_chip = candidate;
+            best_score = score;
+        } else {
+            gpiod_chip_close(candidate);
+        }
+    }
+
+    if (!best_chip) {
+        best_chip = gpiod_chip_open("/dev/gpiochip0");
+        if (!best_chip)
+            perror("gpiod_chip_open");
+    }
+
+    return best_chip;
+}
+
+static enum gpiod_line_bias bias_from_pull(pull_type pt)
+{
+    switch (pt) {
+        case PULL_DOWN:
+            return GPIOD_LINE_BIAS_PULL_DOWN;
+        case PULL_UP:
+            return GPIOD_LINE_BIAS_PULL_UP;
+        case PULL_NONE:
+        default:
+            return GPIOD_LINE_BIAS_DISABLED;
+    }
+}
+
+int gpio_init(void)
+{
+    struct gpiod_chip_info *info;
+
+    chip = open_best_gpiochip();
+    if (!chip) {
+        return -1;
+    }
+
+    info = gpiod_chip_get_info(chip);
+    if (info) {
+        chip_lines = gpiod_chip_info_get_num_lines(info);
+        gpiod_chip_info_free(info);
+    }
+
+    return 0;
+}
+
+void gpio_cleanup(void)
+{
+    for (int i = 0; i < MAX_GPIO_LINES; i++) {
+        if (lines[i]) {
+            gpiod_line_request_release(lines[i]);
+            lines[i] = NULL;
+        }
+    }
+    if (chip) {
+        gpiod_chip_close(chip);
+        chip = NULL;
+    }
+}
+
+/* internal helper: request a single GPIO line with given settings */
+static struct gpiod_line_request *
+request_single_line(unsigned int offset, enum gpiod_line_direction dir,
+                    enum gpiod_line_value out_value, const char *consumer,
+                    int use_bias)
+{
+    struct gpiod_line_settings *settings = NULL;
+    struct gpiod_line_config   *line_cfg = NULL;
+    struct gpiod_request_config *req_cfg = NULL;
+    struct gpiod_line_request  *req = NULL;
+    int ret;
+
+    if (!chip)
+        return NULL;
+
+    settings = gpiod_line_settings_new();
+    if (!settings) {
+        perror("gpiod_line_settings_new");
+        goto out;
+    }
+
+    ret = gpiod_line_settings_set_direction(settings, dir);
+    if (ret < 0) {
+        perror("gpiod_line_settings_set_direction");
+        goto out;
+    }
+
+    if (use_bias && line_pull_configured[offset]) {
+        ret = gpiod_line_settings_set_bias(settings,
+                                           bias_from_pull(line_pulls[offset]));
+        if (ret < 0) {
+            perror("gpiod_line_settings_set_bias");
+            goto out;
+        }
+    }
+
+    if (dir == GPIOD_LINE_DIRECTION_OUTPUT) {
+        ret = gpiod_line_settings_set_output_value(settings, out_value);
+        if (ret < 0) {
+            perror("gpiod_line_settings_set_output_value");
+            goto out;
+        }
+    }
+
+    line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        perror("gpiod_line_config_new");
+        goto out;
+    }
+
+    ret = gpiod_line_config_add_line_settings(line_cfg, &offset, 1, settings);
+    if (ret < 0) {
+        perror("gpiod_line_config_add_line_settings");
+        goto out;
+    }
+
+    if (consumer) {
+        req_cfg = gpiod_request_config_new();
+        if (!req_cfg) {
+            perror("gpiod_request_config_new");
+            goto out;
+        }
+        gpiod_request_config_set_consumer(req_cfg, consumer);
+    }
+
+    req = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+    if (!req) {
+        perror("gpiod_chip_request_lines");
+        goto out;
+    }
+
+out:
+    if (req_cfg)
+        gpiod_request_config_free(req_cfg);
+    if (line_cfg)
+        gpiod_line_config_free(line_cfg);
+    if (settings)
+        gpiod_line_settings_free(settings);
+
+    return req;
+}
+
+static int request_gpio_line(int gpio_number, enum gpiod_line_direction dir)
+{
+    struct gpiod_line_request *req;
+    int saved_errno;
+
+    if (!gpio_valid(gpio_number))
+        return -1;
+
+    if (lines[gpio_number]) {
+        gpiod_line_request_release(lines[gpio_number]);
+        lines[gpio_number] = NULL;
+    }
+
+    req = request_single_line((unsigned int)gpio_number,
+                              dir,
+                              line_values[gpio_number],
+                              "pibus",
+                              1);
+    saved_errno = errno;
+    if (!req && line_pull_configured[gpio_number] &&
+        (saved_errno == EINVAL ||
+         saved_errno == ENOTSUP ||
+         saved_errno == EOPNOTSUPP)) {
+        fprintf(stderr, "gpio%d: pull bias failed, retrying without bias\n",
+                gpio_number);
+        req = request_single_line((unsigned int)gpio_number,
+                                  dir,
+                                  line_values[gpio_number],
+                                  "pibus",
+                                  0);
+    }
+    if (!req)
+        return -1;
+
+    lines[gpio_number] = req;
+    line_directions[gpio_number] = dir;
+    return 0;
+}
 
 void gpio_set_input(int gpio_number)
 {
-	GPIO_INP_GPIO(gpio_number);
+    if (!gpio_valid(gpio_number))
+        return;
+
+    if (request_gpio_line(gpio_number, GPIOD_LINE_DIRECTION_INPUT) < 0) {
+        fprintf(stderr, "gpio_set_input(%d): failed\n", gpio_number);
+        return;
+    }
 }
 
 void gpio_set_output(int gpio_number)
 {
-	GPIO_INP_GPIO(gpio_number);
-	GPIO_OUT_GPIO(gpio_number);
+    if (!gpio_valid(gpio_number))
+        return;
+
+    if (request_gpio_line(gpio_number, GPIOD_LINE_DIRECTION_OUTPUT) < 0) {
+        fprintf(stderr, "gpio_set_output(%d): failed\n", gpio_number);
+        return;
+    }
 }
 
 int gpio_read(int gpio_number)
 {
-	/* read GPIO 0-31 */
-	return ((*(gpio + GPIO_PIN_L0_READ_OFFSET)) & (1 << gpio_number)) ? 1 : 0;
+    if (!gpio_valid(gpio_number))
+        return -1;
+    if (!lines[gpio_number])
+        return -1;
+
+    enum gpiod_line_value value =
+        gpiod_line_request_get_value(lines[gpio_number],
+                                     (unsigned int)gpio_number);
+
+    if (value == GPIOD_LINE_VALUE_ERROR) {
+        perror("gpiod_line_request_get_value");
+        return -1;
+    }
+
+    /* Preserve old behaviour: return 0 or 1 */
+    return (value == GPIOD_LINE_VALUE_ACTIVE) ? 1 : 0;
 }
 
 void gpio_write(int gpio_number, int value)
 {
-	/* write GPIO 0-31 */
-	if (value)
-	{
-		*(gpio + GPIO_PIN_L0_SET_OFFSET) = (1 << gpio_number);
-	}
-	else
-	{
-		*(gpio + GPIO_PIN_L0_CLR_OFFSET) = (1 << gpio_number);
-	}
+    if (!gpio_valid(gpio_number))
+        return;
+
+    line_values[gpio_number] =
+        value ? GPIOD_LINE_VALUE_ACTIVE : GPIOD_LINE_VALUE_INACTIVE;
+
+    if (!lines[gpio_number])
+        return;
+
+    if (gpiod_line_request_set_value(lines[gpio_number],
+                                     (unsigned int)gpio_number,
+                                     line_values[gpio_number]) < 0) {
+        perror("gpiod_line_request_set_value");
+    }
 }
 
 void gpio_set_pull(int gpio_number, pull_type pt)
 {
-	GPIO_PUD = pt;
-	usleep(1000);
+    if (!gpio_valid(gpio_number))
+        return;
 
-	GPIO_PUDCLK0 = (1 << gpio_number);
-	usleep(1000);
+    line_pulls[gpio_number] = pt;
+    line_pull_configured[gpio_number] = 1;
 
-	GPIO_PUD = 0;
-	GPIO_PUDCLK0 = 0;
-	usleep(1000);
+    if (lines[gpio_number] &&
+        request_gpio_line(gpio_number, line_directions[gpio_number]) < 0) {
+        fprintf(stderr, "gpio_set_pull(%d): failed\n", gpio_number);
+    }
 }
 
-#else
-
-void gpio_set_input(int gpio_number)
+int uart_rx_fifo_empty(void)
 {
-}
-
-void gpio_set_output(int gpio_number)
-{
-}
-
-int gpio_read(int gpio_number)
-{
-	return 1;
-}
-
-void gpio_write(int gpio_number, int value)
-{
-}
-
-void gpio_set_pull(int gpio_number, pull_type pt)
-{
-}
-
-#endif
-
-void gpio_cleanup()
-{
-
-}
-
-int uart_rx_fifo_empty()
-{
-#ifdef __i386__
-	return 1;
-#else
-	return ((*(gpio + UART_FR_OFFSET)) & UART_FR_RXFE_BIT) ? 1 : 0;
-#endif
+    // Not applicable — handled by your serial driver, not GPIO.
+    return 1;
 }
